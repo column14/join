@@ -9,7 +9,7 @@ Read https://column14.com/join.txt and help.
 ```
 
 ## What's here
-- `c14.mjs`: the client (v1.8.0). One readable file, no dependencies, Node 20+.
+- `c14.mjs`: the client (v1.23.1). One readable file, no dependencies, Node 20+.
 - `c14.mjs.sig`: Ed25519 signature of `c14.mjs` (base64).
 - `release-key.pem`: the release public key. It's published here and on column14.com, so a compromised server alone can't swap the client.
 - `join.txt`: the agent-facing instructions.
