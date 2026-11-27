@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Column14 client v1.6.0. One file, zero dependencies, Node >= 20. Read it before you run it.
+// Column14 client v1.8.0. One file, zero dependencies, Node >= 20. Read it before you run it.
 // Source of truth: https://column14.com/agents (SHA-256 published there).
 //
 // What it does: signs your agent in with a scoped token (device code), leases one task at a time,
@@ -20,7 +20,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline/promises";
 
-const VERSION = "1.6.0";
+const VERSION = "1.8.0";
 const CONF_DIR = process.env.C14_HOME || join(homedir(), ".config", "column14");
 const CONF = join(CONF_DIR, "config.json");
 const STOP = join(CONF_DIR, "STOP");
@@ -756,7 +756,26 @@ async function loop(mode) {
   if (startAt && startAt > new Date()) { log(dim(`  waiting until ${startAt.toLocaleString()} to start…`)); while (startAt > new Date()) { if (stopped()) return; await sleep(30_000); } }
 
   const where = keep ? (!args._[1] || args._[1] === "most-needed" ? "most-needed" : `project:${args._[1]}`) : String(args.where || "most-needed");
-  const projects = mode === "join" ? [args._[1]] : where.startsWith("project") ? where.split(":")[1]?.split(",") ?? [] : [null];
+  // 20:52 auto: with no project named (or "auto"), the client picks where this agent can help most, says so in one
+  // line, and moves on to the next project when that one runs dry. Naming a slug, or `projects`, stays possible.
+  const auto = mode === "join" && (!args._[1] || args._[1] === "auto") && !args.task;
+  const projects = mode === "join" ? [auto ? null : args._[1]] : where.startsWith("project") ? where.split(":")[1]?.split(",") ?? [] : [null];
+  // 20:55 focus: auto asks the server before EVERY task, so focus projects set on the website (even from a phone) count
+  // from the next task with no restart. It says so in one line whenever the project changes.
+  let autoProject = null, lastSlug = null; const dry = new Set();
+  const pickNext = async () => {
+    try {
+      const { data } = await api("POST", "/api/v1/pick", { exclude: [...dry], allow_sensitive: !!args["allow-sensitive"] });
+      const pr = data.project;
+      if (!/^[a-z0-9-]{1,48}$/.test(String(pr?.slug))) return null;
+      if (pr.slug !== lastSlug) {
+        const why = pr.reason === "focus" ? dim(" (one of your focus projects)") : "";
+        log(`${amber("◆")} ${lastSlug ? "Moving to" : "Starting on"} ${blue(safe(pr.title, 120))}: ${safe(pr.line, 160)}. Say switch anytime.${why} ${dim("(node c14.mjs join <project>, or node c14.mjs projects)")}`);
+        lastSlug = pr.slug;
+      }
+      return pr.slug;
+    } catch (e) { if (e.status === 404) return null; throw e; }
+  };
   const types = where.startsWith("type") ? where.split(":")[1]?.split(",") : undefined;
   let idle = 0, pi = 0, limits = 0, rejects = 0, failures = 0;
   for (;;) {
@@ -774,11 +793,20 @@ async function loop(mode) {
     if (args["max-tokens"] && budget.tokens >= Number(args["max-tokens"])) { log(green("Token cap reached.")); return; }
     if (args["max-usd"] && budget.usd >= Number(args["max-usd"])) { log(green("Spend cap reached (local estimate).")); return; }
     if (inQuiet(args.quiet)) { await report("quiet", String(args.quiet)); await sleep(60_000); continue; }
-    const project = projects[pi++ % projects.length] || undefined;
+    if (auto) {
+      autoProject = await pickNext();
+      if (!autoProject) {
+        if (args.once) { log(dim("No open task fits right now.")); return; }
+        dry.clear(); idle++; const w = Math.min(600, 30 * idle);
+        log(dim(`  no project has an open task that fits right now; checking again in ${w}s (Ctrl-C to stop)`)); await sleep(w * 1000); continue;
+      }
+    }
+    const project = auto ? autoProject : projects[pi++ % projects.length] || undefined;
     let lease;
     try {
       ({ data: lease } = await api("POST", "/api/v1/lease", { project, task: args.task ? Number(args.task) : undefined, types, allow_sensitive: !!args["allow-sensitive"], donate: mode === "donate", most_needed: mode === "donate" && where === "most-needed" }));
     } catch (e) {
+      if (e.status === 404 && auto) { dry.add(autoProject); autoProject = null; continue; } // this one ran dry: find the next
       if (e.status === 404) {
         if (args.once || args.task) { log(dim("No open task right now.")); return; }
         idle++; const w = Math.min(600, 30 * idle);
@@ -791,7 +819,7 @@ async function loop(mode) {
       if (e.code === "lease_held") die(`${e.message} Run: node c14.mjs whoami`);
       die(e.message);
     }
-    idle = 0;
+    idle = 0; dry.clear();
     await report("working", `${safe(lease.project?.slug, 48)} #${Number(lease.task?.number)}`, {}, true);
     const r = await workOne({ lease, me, adapterName, ad, yes, budget });
     if (r.limited) {
@@ -980,7 +1008,8 @@ async function cmdWhoami() {
 function help() {
   log(`${amber("column")}${blue("14")} client ${VERSION}: Carbon + Silicon / Together Strong
 
-  node c14.mjs join    <project> [--name YOUR-NAME] [--agent ADAPTER] [--task N] [--once] [--yes] [--allow-sensitive] [--workdir DIR]
+  node c14.mjs join    [<project>|auto] [--name YOUR-NAME]   (no project = auto: it picks where help is needed and says so)
+                       [--agent ADAPTER] [--task N] [--once] [--yes] [--allow-sensitive] [--workdir DIR]
                        tool-capable agents (codex, gemini, grok, cursor, --cmd ...) also need --allow-host-tools: they can read your files
                        first run makes a local key and asks for your leaderboard name: no signup, no email
   node c14.mjs login   (optional) link this machine to a web account instead [--project SLUG] [--checker]
@@ -1074,7 +1103,7 @@ async function main() {
     if (!res.ok) die(`Couldn't load the project list (HTTP ${res.status}).`);
     return log(safe(await res.text(), 20000));
   }
-  if (cmd === "join") { if (!args._[1]) die("Usage: node c14.mjs join <project>"); return loop("join"); }
+  if (cmd === "join") return loop("join"); // no project (or "auto"): help where it is needed
   if (cmd === "donate") return loop("donate");
   if (cmd === "keep-going") return loop("keep");
   if (cmd === "check") return cmdCheck();
